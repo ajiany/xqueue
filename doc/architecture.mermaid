@@ -1,0 +1,52 @@
+graph TB
+    subgraph "Client Layer"
+        A1[HTTP Client]
+        A2[MQTT Client] 
+        A3[Web Console]
+    end
+    
+    subgraph "API Gateway"
+        B1[HTTP API Handler]
+        B2[Task Router]
+        B3[Middleware]
+    end
+    
+    subgraph "Core Processing Layer"
+        C1[Task Manager]
+        C2[Worker Pool]
+        C3[Semaphore Manager]
+        C4[MQTT Notifier]
+    end
+    
+    subgraph "Storage & Queue Layer"
+        D1[Redis Storage]
+        D2[Kafka Queue]
+    end
+    
+    subgraph "Infrastructure Layer"
+        E1[Redis Cluster]
+        E2[Kafka Cluster]
+        E3[MQTT Broker]
+    end
+    
+    A1 --> B1
+    A2 --> E3
+    A3 --> B1
+    
+    B1 --> B2
+    B1 --> B3
+    B2 --> C1
+    
+    C1 --> C2
+    C1 --> C3
+    C1 --> C4
+    C1 --> D1
+    C1 --> D2
+    
+    C4 --> E3
+    D1 --> E1
+    D2 --> E2
+    
+    C2 --> D1
+    C2 --> D2
+    C2 --> C4

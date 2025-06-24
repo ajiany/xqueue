@@ -1,0 +1,35 @@
+sequenceDiagram
+    participant Client
+    participant API as API Gateway
+    participant TM as Task Manager
+    participant RS as Redis Storage
+    participant KQ as Kafka Queue
+    participant MQ as MQTT Notifier
+    participant WP as Worker Pool
+    
+    Note over Client,WP: Task Submission Phase
+    Client->>API: POST /api/v1/tasks
+    API->>TM: Validate & Create Task
+    TM->>RS: Save Task State
+    TM->>KQ: Publish to Queue
+    TM->>MQ: Notify Task Created
+    API->>Client: Return Task ID
+    
+    Note over Client,WP: Task Processing Phase
+    WP->>KQ: Consume Task
+    WP->>RS: Update Status: Processing
+    WP->>MQ: Notify Processing
+    rect rgb(240, 248, 255)
+        WP->>WP: Execute Task Handler
+    end
+    WP->>RS: Update Status: Success
+    WP->>MQ: Notify Success
+    
+    Note over Client,WP: Query Phase
+    Client->>API: GET /api/v1/tasks/{id}
+    API->>RS: Get Task Data
+    RS->>API: Task Data
+    API->>Client: Return Task Status
+    
+    Note over Client,WP: Real-time Notifications
+    MQ-->>Client: MQTT: task/status/{id}
