@@ -286,4 +286,4 @@ MIT License
 ## 📞 联系我们
 
 - 邮箱: your-email@example.com
-- 项目地址: https://github.com/your-org/xqueue
+- 项目地址: https://github.com/ajiany/xqueue
