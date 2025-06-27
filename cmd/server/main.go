@@ -6,40 +6,132 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 	"time"
 
 	"xqueue/internal/api"
 	"xqueue/internal/config"
+	"xqueue/internal/lock"
 	"xqueue/internal/models"
 	"xqueue/internal/notifier"
 	"xqueue/internal/storage"
+	"xqueue/internal/worker"
 
 	"github.com/gin-gonic/gin"
 	"github.com/go-redis/redis/v8"
+	"github.com/google/uuid"
 	"github.com/sirupsen/logrus"
 )
 
-// SimpleTaskManager 简化版任务管理器
-type SimpleTaskManager struct {
-	storage  *storage.RedisStorage
-	notifier *notifier.MQTTNotifier
-	logger   *logrus.Logger
+// EnhancedTaskManager 增强版任务管理器
+type EnhancedTaskManager struct {
+	storage    *storage.RedisStorage
+	notifier   *notifier.MQTTNotifier
+	lock       *lock.RedisLock
+	logger     *logrus.Logger
+	workerPool *worker.WorkerPool
+
+	// 处理器管理
 	handlers map[string]models.TaskHandler
+	mu       sync.RWMutex
+
+	// 实例标识
+	instanceID string
 }
 
-// NewSimpleTaskManager 创建简化版任务管理器
-func NewSimpleTaskManager(storage *storage.RedisStorage, notifier *notifier.MQTTNotifier, logger *logrus.Logger) *SimpleTaskManager {
-	return &SimpleTaskManager{
-		storage:  storage,
-		notifier: notifier,
-		logger:   logger,
-		handlers: make(map[string]models.TaskHandler),
+// WorkerAdapter 适配器，实现WorkerPool的TaskConsumer接口
+type WorkerAdapter struct {
+	taskManager *EnhancedTaskManager
+}
+
+// ConsumeNextTask 实现worker.TaskConsumer接口
+func (wa *WorkerAdapter) ConsumeNextTask() error {
+	_, err := wa.taskManager.ConsumeNextTask()
+	return err
+}
+
+// NewEnhancedTaskManager 创建任务管理器
+func NewEnhancedTaskManager(storage *storage.RedisStorage, notifier *notifier.MQTTNotifier,
+	redisClient *redis.Client, logger *logrus.Logger) *EnhancedTaskManager {
+
+	taskManager := &EnhancedTaskManager{
+		storage:    storage,
+		notifier:   notifier,
+		lock:       lock.NewRedisLock(redisClient, logger),
+		logger:     logger,
+		handlers:   make(map[string]models.TaskHandler),
+		instanceID: uuid.New().String(),
 	}
+
+	// 创建worker池适配器
+	workerAdapter := &WorkerAdapter{taskManager: taskManager}
+	taskManager.workerPool = worker.NewWorkerPool(3, workerAdapter, time.Second, logger)
+
+	return taskManager
 }
 
-// SubmitTask 提交任务
-func (tm *SimpleTaskManager) SubmitTask(taskType string, payload map[string]interface{}, options ...api.TaskOption) (*models.Task, error) {
+// RegisterHandler 注册任务处理器
+func (tm *EnhancedTaskManager) RegisterHandler(handler models.TaskHandler) error {
+	tm.mu.Lock()
+	defer tm.mu.Unlock()
+
+	taskType := handler.GetType()
+	if _, exists := tm.handlers[taskType]; exists {
+		return fmt.Errorf("handler for task type '%s' already registered", taskType)
+	}
+
+	tm.handlers[taskType] = handler
+	tm.logger.WithField("task_type", taskType).Info("Task handler registered")
+
+	return nil
+}
+
+// UnregisterHandler 注销任务处理器
+func (tm *EnhancedTaskManager) UnregisterHandler(taskType string) error {
+	tm.mu.Lock()
+	defer tm.mu.Unlock()
+
+	if _, exists := tm.handlers[taskType]; !exists {
+		return fmt.Errorf("handler for task type '%s' not found", taskType)
+	}
+
+	delete(tm.handlers, taskType)
+	tm.logger.WithField("task_type", taskType).Info("Task handler unregistered")
+
+	return nil
+}
+
+// IsHandlerRegistered 检查处理器是否已注册
+func (tm *EnhancedTaskManager) IsHandlerRegistered(taskType string) bool {
+	tm.mu.RLock()
+	defer tm.mu.RUnlock()
+
+	_, exists := tm.handlers[taskType]
+	return exists
+}
+
+// GetRegisteredHandlers 获取已注册的处理器列表
+func (tm *EnhancedTaskManager) GetRegisteredHandlers() []string {
+	tm.mu.RLock()
+	defer tm.mu.RUnlock()
+
+	handlers := make([]string, 0, len(tm.handlers))
+	for taskType := range tm.handlers {
+		handlers = append(handlers, taskType)
+	}
+
+	return handlers
+}
+
+// SubmitTask 提交任务 (增强版，包含任务类型验证)
+func (tm *EnhancedTaskManager) SubmitTask(taskType string, payload map[string]interface{}, options ...api.TaskOption) (*models.Task, error) {
+	// 验证任务类型是否已注册
+	if !tm.IsHandlerRegistered(taskType) {
+		return nil, fmt.Errorf("task type '%s' is not registered. Please register a handler for this task type first. Registered types: %v",
+			taskType, tm.GetRegisteredHandlers())
+	}
+
 	task := &models.Task{
 		ID:             generateTaskID(),
 		Type:           taskType,
@@ -78,17 +170,17 @@ func (tm *SimpleTaskManager) SubmitTask(taskType string, payload map[string]inte
 }
 
 // GetTask 获取任务
-func (tm *SimpleTaskManager) GetTask(taskID string) (*models.Task, error) {
+func (tm *EnhancedTaskManager) GetTask(taskID string) (*models.Task, error) {
 	return tm.storage.GetTask(context.Background(), taskID)
 }
 
 // GetTasksByStatus 根据状态获取任务
-func (tm *SimpleTaskManager) GetTasksByStatus(status models.TaskStatus, limit, offset int64) ([]*models.Task, error) {
+func (tm *EnhancedTaskManager) GetTasksByStatus(status models.TaskStatus, limit, offset int64) ([]*models.Task, error) {
 	return tm.storage.GetTasksByStatus(context.Background(), status, limit, offset)
 }
 
 // CancelTask 取消任务
-func (tm *SimpleTaskManager) CancelTask(taskID string) error {
+func (tm *EnhancedTaskManager) CancelTask(taskID string) error {
 	err := tm.storage.UpdateTaskStatus(context.Background(), taskID, models.TaskStatusCanceled, "")
 	if err != nil {
 		return err
@@ -102,22 +194,25 @@ func (tm *SimpleTaskManager) CancelTask(taskID string) error {
 	return nil
 }
 
-// GetStats 获取统计信息
-func (tm *SimpleTaskManager) GetStats() (map[string]interface{}, error) {
+// GetStats 获取统计信息 (增强版，包含worker池信息)
+func (tm *EnhancedTaskManager) GetStats() (map[string]interface{}, error) {
 	taskStats, err := tm.storage.GetTaskStats(context.Background())
 	if err != nil {
 		return nil, err
 	}
 
 	stats := map[string]interface{}{
-		"tasks": taskStats,
+		"tasks":       taskStats,
+		"worker_pool": tm.workerPool.GetStats(),
+		"handlers":    tm.GetRegisteredHandlers(),
+		"instance_id": tm.instanceID,
 	}
 
 	return stats, nil
 }
 
 // ProcessTask 处理单个任务
-func (tm *SimpleTaskManager) ProcessTask(taskID string) error {
+func (tm *EnhancedTaskManager) ProcessTask(taskID string) error {
 	// 获取任务
 	task, err := tm.storage.GetTask(context.Background(), taskID)
 	if err != nil {
@@ -130,7 +225,10 @@ func (tm *SimpleTaskManager) ProcessTask(taskID string) error {
 	}
 
 	// 查找处理器
+	tm.mu.RLock()
 	handler, exists := tm.handlers[task.Type]
+	tm.mu.RUnlock()
+
 	if !exists {
 		return fmt.Errorf("no handler found for task type: %s", task.Type)
 	}
@@ -186,9 +284,11 @@ func (tm *SimpleTaskManager) ProcessTask(taskID string) error {
 }
 
 // ConsumeNextTask 消费下一个待处理任务
-func (tm *SimpleTaskManager) ConsumeNextTask() (*models.Task, error) {
+func (tm *EnhancedTaskManager) ConsumeNextTask() (*models.Task, error) {
+	ctx := context.Background()
+
 	// 获取下一个待处理任务
-	tasks, err := tm.storage.GetTasksByStatus(context.Background(), models.TaskStatusPending, 1, 0)
+	tasks, err := tm.storage.GetTasksByStatus(ctx, models.TaskStatusPending, 1, 0)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get pending tasks: %w", err)
 	}
@@ -199,6 +299,37 @@ func (tm *SimpleTaskManager) ConsumeNextTask() (*models.Task, error) {
 
 	task := tasks[0]
 
+	// 尝试获取任务锁
+	lockKey := fmt.Sprintf("task:%s", task.ID)
+	lockValue := fmt.Sprintf("%s:%d", tm.instanceID, time.Now().UnixNano())
+	lockExpiration := 5 * time.Minute // 锁过期时间
+
+	acquired, err := tm.lock.AcquireLock(ctx, lockKey, lockValue, lockExpiration)
+	if err != nil {
+		return nil, fmt.Errorf("failed to acquire task lock: %w", err)
+	}
+
+	if !acquired {
+		return nil, fmt.Errorf("failed to acquire task lock")
+	}
+
+	// 确保在函数结束时释放锁
+	defer func() {
+		if err := tm.lock.ReleaseLock(ctx, lockKey, lockValue); err != nil {
+			tm.logger.WithError(err).WithField("task_id", task.ID).Warn("Failed to release task lock")
+		}
+	}()
+
+	// 再次检查任务状态（防止在获取锁期间任务状态发生变化）
+	task, err = tm.storage.GetTask(ctx, task.ID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get task after lock: %w", err)
+	}
+
+	if task.Status != models.TaskStatusPending {
+		return nil, fmt.Errorf("task %s is no longer pending, current status: %s", task.ID, task.Status)
+	}
+
 	// 处理任务
 	if err := tm.ProcessTask(task.ID); err != nil {
 		return nil, err
@@ -207,24 +338,14 @@ func (tm *SimpleTaskManager) ConsumeNextTask() (*models.Task, error) {
 	return task, nil
 }
 
-// StartTaskConsumer 启动任务消费者
-func (tm *SimpleTaskManager) StartTaskConsumer(interval time.Duration) {
-	ticker := time.NewTicker(interval)
-	go func() {
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ticker.C:
-				_, err := tm.ConsumeNextTask()
-				if err != nil {
-					if err.Error() != "no pending tasks available" {
-						tm.logger.WithError(err).Debug("Failed to consume task")
-					}
-				}
-			}
-		}
-	}()
-	tm.logger.WithField("interval", interval).Info("Task consumer started")
+// StartWorkerPool 启动工作池
+func (tm *EnhancedTaskManager) StartWorkerPool() error {
+	return tm.workerPool.Start()
+}
+
+// StopWorkerPool 停止工作池
+func (tm *EnhancedTaskManager) StopWorkerPool() error {
+	return tm.workerPool.Stop()
 }
 
 // generateTaskID 生成任务ID
@@ -258,13 +379,41 @@ func (h *ExampleTaskHandler) GetType() string {
 	return "example"
 }
 
+// EmailTaskHandler 邮件任务处理器示例
+type EmailTaskHandler struct {
+	logger *logrus.Logger
+}
+
+func (h *EmailTaskHandler) Handle(task *models.Task) error {
+	h.logger.WithField("task_id", task.ID).Info("Processing email task")
+
+	// 模拟邮件发送
+	time.Sleep(time.Second * 1)
+
+	if to, ok := task.Payload["to"].(string); ok {
+		if subject, ok := task.Payload["subject"].(string); ok {
+			h.logger.WithFields(logrus.Fields{
+				"task_id": task.ID,
+				"to":      to,
+				"subject": subject,
+			}).Info("Email sent successfully")
+		}
+	}
+
+	return nil
+}
+
+func (h *EmailTaskHandler) GetType() string {
+	return "email"
+}
+
 func main() {
 	// 创建日志器
 	logger := logrus.New()
 	logger.SetLevel(logrus.InfoLevel)
 	logger.SetFormatter(&logrus.JSONFormatter{})
 
-	logger.Info("Starting XQueue Server")
+	logger.Info("Starting XQueue Server v0.0.2")
 
 	// 加载配置
 	cfg := config.DefaultConfig()
@@ -303,15 +452,24 @@ func main() {
 		logger.Info("Connected to MQTT broker successfully")
 	}
 
-	// 创建任务管理器
-	taskManager := NewSimpleTaskManager(storage, mqttNotifier, logger)
+	// 创建增强版任务管理器
+	taskManager := NewEnhancedTaskManager(storage, mqttNotifier, redisClient, logger)
 
-	// 注册示例任务处理器
+	// 注册任务处理器
 	exampleHandler := &ExampleTaskHandler{logger: logger}
-	taskManager.handlers[exampleHandler.GetType()] = exampleHandler
+	if err := taskManager.RegisterHandler(exampleHandler); err != nil {
+		logger.WithError(err).Fatal("Failed to register example handler")
+	}
 
-	// 启动任务消费者（每5秒检查一次）
-	taskManager.StartTaskConsumer(5 * time.Second)
+	emailHandler := &EmailTaskHandler{logger: logger}
+	if err := taskManager.RegisterHandler(emailHandler); err != nil {
+		logger.WithError(err).Fatal("Failed to register email handler")
+	}
+
+	// 启动工作池
+	if err := taskManager.StartWorkerPool(); err != nil {
+		logger.WithError(err).Fatal("Failed to start worker pool")
+	}
 
 	// 设置 Gin 模式
 	gin.SetMode(cfg.Server.Mode)
@@ -363,6 +521,11 @@ func main() {
 	// 优雅关闭
 	ctx, cancel = context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
+
+	// 停止工作池
+	if err := taskManager.StopWorkerPool(); err != nil {
+		logger.WithError(err).Error("Failed to stop worker pool")
+	}
 
 	if err := server.Shutdown(ctx); err != nil {
 		logger.WithError(err).Error("Server forced to shutdown")

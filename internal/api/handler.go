@@ -20,6 +20,12 @@ type TaskManager interface {
 	GetStats() (map[string]interface{}, error)
 	ProcessTask(taskID string) error
 	ConsumeNextTask() (*models.Task, error)
+
+	// v0.0.2
+	RegisterHandler(handler models.TaskHandler) error
+	UnregisterHandler(taskType string) error
+	IsHandlerRegistered(taskType string) bool
+	GetRegisteredHandlers() []string
 }
 
 // TaskOption 任务选项
@@ -59,6 +65,12 @@ func (h *Handler) SetupRoutes(r *gin.Engine) {
 
 		// 健康检查
 		api.GET("/health", h.Health)
+
+		// v0.0.2
+		handlers := api.Group("/handlers")
+		{
+			handlers.GET("", h.GetHandlers)
+		}
 	}
 }
 
@@ -273,4 +285,14 @@ func WithConcurrency(key string, maxConcurrency int) TaskOption {
 		task.ConcurrencyKey = key
 		task.MaxConcurrency = maxConcurrency
 	}
+}
+
+// GetHandlers 获取已注册的处理器列表
+func (h *Handler) GetHandlers(c *gin.Context) {
+	handlers := h.taskManager.GetRegisteredHandlers()
+
+	c.JSON(http.StatusOK, gin.H{
+		"handlers": handlers,
+		"count":    len(handlers),
+	})
 }

@@ -1,6 +1,8 @@
-# XQueue - 分布式任务队列系统
+# XQueue - 分布式任务队列
 
 XQueue 是一个高性能、可扩展的分布式任务队列系统，基于 Go 语言开发，集成了 Redis、Kafka 和 MQTT 等技术栈。
+
+> **当前版本：v0.0.2** - 支持任务类型验证、多Worker并发处理、分布式锁等增强功能
 
 ## 🌟 核心特性
 
@@ -29,6 +31,21 @@ XQueue 是一个高性能、可扩展的分布式任务队列系统，基于 Go 
 - **WebSocket 兼容**：浏览器可直接订阅状态更新
 - **可配置 QoS 等级**：保证消息传递质量
 
+### 6. 任务类型验证 (v0.0.2 新增)
+- **处理器注册机制**：只允许提交已注册处理器的任务类型
+- **类型安全保证**：防止未知任务类型导致的任务堆积
+- **动态处理器管理**：支持运行时注册和注销处理器
+
+### 7. 多Worker并发处理 (v0.0.2 新增)
+- **WorkerPool 架构**：支持多个Worker并发处理任务
+- **可配置Worker数量**：根据系统负载调整并发度
+- **优雅关闭机制**：避免协程泄露，支持平滑重启
+
+### 8. 分布式任务锁 (v0.0.2 新增)
+- **Redis分布式锁**：防止多个Worker重复处理同一任务
+- **锁自动过期**：避免死锁，支持锁超时清理
+- **竞争处理优化**：高并发场景下的任务分配优化
+
 ## 🚀 快速开始
 
 ### 环境要求
@@ -42,7 +59,7 @@ XQueue 是一个高性能、可扩展的分布式任务队列系统，基于 Go 
 
 ```bash
 # 克隆项目
-git clone https://github.com/your-org/xqueue.git
+git clone git@github.com:ajiany/xqueue.git
 cd xqueue
 
 # 安装依赖
@@ -99,7 +116,13 @@ curl "http://localhost:8080/api/v1/tasks?status=pending&limit=10&offset=0"
 curl -X DELETE http://localhost:8080/api/v1/tasks/{task_id}
 ```
 
-#### 5. 获取系统统计
+#### 5. 获取已注册的处理器 (v0.0.2 新增)
+
+```bash
+curl http://localhost:8080/api/v1/handlers
+```
+
+#### 6. 获取系统统计
 
 ```bash
 curl http://localhost:8080/api/v1/stats
@@ -122,12 +145,13 @@ curl http://localhost:8080/api/v1/stats
 |------|------|------|
 | GET | `/api/v1/stats` | 获取系统统计 |
 | GET | `/api/v1/health` | 健康检查 |
+| GET | `/api/v1/handlers` | 获取已注册的处理器 (v0.0.2) |
 
 ### 任务提交参数
 
 ```json
 {
-  "type": "task_type",           // 必需：任务类型
+  "type": "task_type",           // 必需：任务类型 (v0.0.2: 必须是已注册的处理器类型)
   "payload": {},                 // 可选：任务数据
   "priority": 1,                 // 可选：优先级 (数字越大优先级越高)
   "max_retry": 3,                // 可选：最大重试次数
@@ -135,6 +159,32 @@ curl http://localhost:8080/api/v1/stats
   "process_timeout": 60,         // 可选：处理超时时间 (秒)
   "concurrency_key": "user_123", // 可选：并发控制键
   "max_concurrency": 5           // 可选：最大并发数
+}
+```
+
+### v0.0.2 新增功能说明
+
+#### 任务类型验证
+从 v0.0.2 开始，系统只接受已注册处理器的任务类型。如果提交未注册的任务类型，将返回错误信息：
+
+```json
+{
+  "error": "task type 'unknown_type' is not registered. Please register a handler for this task type first. Registered types: [\"example\", \"email\"]"
+}
+```
+
+#### 内置处理器类型
+- `example`: 示例任务处理器
+- `email`: 邮件发送任务处理器
+
+#### 获取处理器信息
+```bash
+curl http://localhost:8080/api/v1/handlers
+
+# 响应示例
+{
+  "handlers": ["example", "email"],
+  "count": 2
 }
 ```
 
