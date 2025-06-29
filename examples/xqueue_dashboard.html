@@ -117,6 +117,7 @@
             align-items: center;
             gap: 10px;
             font-weight: 500;
+            flex-shrink: 0;
         }
 
         .connection-status.connected {
@@ -383,9 +384,14 @@
                 <div class="icon">🏗️</div>
                 <h1>系统状态</h1>
             </div>
-            <button class="refresh-btn" onclick="refreshAll()">
-                🔄 刷新
-            </button>
+            <div style="display: flex; gap: 10px;">
+                <button id="autoRefreshBtn" class="refresh-btn" onclick="toggleAutoRefresh()">
+                    ▶️ 启动自动刷新
+                </button>
+                <button class="refresh-btn" onclick="refreshAll()">
+                    🔄 手动刷新
+                </button>
+            </div>
         </div>
 
         <!-- 状态统计 -->
@@ -408,10 +414,17 @@
             </div>
         </div>
 
-        <!-- MQTT 连接状态 -->
-        <div id="mqttStatus" class="connection-status disconnected">
-            <span class="status-indicator disconnected"></span>
-            <span>MQTT 未连接</span>
+        <!-- 连接和刷新状态 -->
+        <div style="display: flex; gap: 15px; margin-bottom: 20px; flex-wrap: wrap;">
+            <div id="mqttStatus" class="connection-status disconnected">
+                <span class="status-indicator disconnected"></span>
+                <span>MQTT 未连接</span>
+            </div>
+            <div id="refreshStatus" class="connection-status connected" style="min-width: 200px;">
+                <span class="status-indicator connected"></span>
+                <span style="white-space: nowrap;">自动刷新已启动</span>
+                <small id="lastUpdateTime" style="margin-left: 10px; opacity: 0.7; white-space: nowrap;"></small>
+            </div>
         </div>
 
         <!-- 系统信息 -->
@@ -473,6 +486,8 @@
         // 全局变量
         let mqttClient = null;
         let isConnected = false;
+        let autoRefreshTimer = null;
+        let autoRefreshEnabled = true;
         
         // 初始化
         document.addEventListener('DOMContentLoaded', function() {
@@ -484,6 +499,14 @@
                 message: "Hello World",
                 duration: 3
             }, null, 2);
+            
+            // 延迟启动自动刷新，确保DOM完全加载
+            setTimeout(() => {
+                startAutoRefresh();
+                updateAutoRefreshButton();
+                updateRefreshStatus();
+                updateLastRefreshTime();
+            }, 500);
         });
 
         // MQTT 连接初始化
@@ -647,6 +670,28 @@
             }
         }
 
+        // 静默API调用函数（用于自动刷新，不更新UI响应区域）
+        async function silentApiCall(url, options = {}) {
+            try {
+                const response = await fetch(`http://localhost:8080${url}`, {
+                    headers: {
+                        'Content-Type': 'application/json',
+                        ...options.headers
+                    },
+                    ...options
+                });
+                
+                if (!response.ok) {
+                    throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+                }
+                
+                const data = await response.json();
+                return data;
+            } catch (error) {
+                throw error;
+            }
+        }
+
         // 刷新所有数据
         async function refreshAll() {
             log('🔄 刷新所有数据...');
@@ -654,12 +699,15 @@
                 getSystemInfo(),
                 refreshStats()
             ]);
+            updateLastRefreshTime();
         }
 
                  // 获取系统信息
-         async function getSystemInfo() {
+         async function getSystemInfo(silent = false) {
              try {
-                 const data = await apiCall('/api/v1/health');
+                 const data = silent 
+                     ? await silentApiCall('/api/v1/health')
+                     : await apiCall('/api/v1/health');
                  document.getElementById('systemInfo').textContent = JSON.stringify(data, null, 2);
              } catch (error) {
                  // 忽略错误，继续执行
@@ -667,9 +715,12 @@
          }
 
                  // 刷新统计信息
-         async function refreshStats() {
+         async function refreshStats(silent = false) {
              try {
-                 const stats = await apiCall('/api/v1/stats');
+                 const stats = silent 
+                     ? await silentApiCall('/api/v1/stats')
+                     : await apiCall('/api/v1/stats');
+                 
                  updateStatsDisplay(stats.tasks);
              } catch (error) {
                  // 设置默认值
@@ -686,10 +737,16 @@
                  // 更新统计显示
          function updateStatsDisplay(stats) {
              const total = (stats.pending || 0) + (stats.processing || 0) + (stats.success || 0) + (stats.failed || 0) + (stats.canceled || 0);
-             document.getElementById('totalTasks').textContent = total;
-             document.getElementById('pendingTasks').textContent = stats.pending || 0;
-             document.getElementById('processingTasks').textContent = stats.processing || 0;
-             document.getElementById('completedTasks').textContent = stats.success || 0;
+             
+             const totalElement = document.getElementById('totalTasks');
+             const pendingElement = document.getElementById('pendingTasks');
+             const processingElement = document.getElementById('processingTasks');
+             const completedElement = document.getElementById('completedTasks');
+             
+             if (totalElement) totalElement.textContent = total;
+             if (pendingElement) pendingElement.textContent = stats.pending || 0;
+             if (processingElement) processingElement.textContent = stats.processing || 0;
+             if (completedElement) completedElement.textContent = stats.success || 0;
          }
 
         // 提交任务
@@ -842,10 +899,94 @@
              document.getElementById('mqttLogs').innerHTML = '<div class="log-entry">日志已清空</div>';
          }
 
-        // 页面卸载时断开 MQTT 连接
+        // 自动刷新功能
+        function startAutoRefresh() {
+            if (autoRefreshTimer) {
+                clearInterval(autoRefreshTimer);
+            }
+            
+            if (autoRefreshEnabled) {
+                autoRefreshTimer = setInterval(async () => {
+                    try {
+                        await refreshStats(true); // 使用静默模式
+                        updateLastRefreshTime();
+                        // 可选：也刷新系统信息（频率较低）
+                        if (Date.now() % 10000 < 1000) { // 每10秒刷新一次系统信息
+                            await getSystemInfo(true); // 使用静默模式
+                        }
+                    } catch (error) {
+                        // 静默处理错误
+                    }
+                }, 1000); // 每秒刷新一次
+                
+                log('🔄 自动刷新已启动 (每秒更新)');
+                updateAutoRefreshButton();
+                updateRefreshStatus();
+            }
+        }
+        
+        function stopAutoRefresh() {
+            if (autoRefreshTimer) {
+                clearInterval(autoRefreshTimer);
+                autoRefreshTimer = null;
+            }
+            log('⏸️ 自动刷新已停止');
+            updateAutoRefreshButton();
+            updateRefreshStatus();
+        }
+        
+        function toggleAutoRefresh() {
+            autoRefreshEnabled = !autoRefreshEnabled;
+            
+            if (autoRefreshEnabled) {
+                startAutoRefresh();
+            } else {
+                stopAutoRefresh();
+            }
+        }
+        
+        function updateAutoRefreshButton() {
+            const button = document.getElementById('autoRefreshBtn');
+            if (button) {
+                if (autoRefreshEnabled && autoRefreshTimer) {
+                    button.textContent = '⏸️ 停止自动刷新';
+                    button.className = 'btn btn-secondary';
+                } else {
+                    button.textContent = '▶️ 启动自动刷新';
+                    button.className = 'btn btn-success';
+                }
+            }
+        }
+        
+        function updateRefreshStatus() {
+            const statusElement = document.getElementById('refreshStatus');
+            const indicator = statusElement.querySelector('.status-indicator');
+            const text = statusElement.querySelector('span');
+            
+            if (autoRefreshEnabled && autoRefreshTimer) {
+                statusElement.className = 'connection-status connected';
+                indicator.className = 'status-indicator connected';
+            } else {
+                statusElement.className = 'connection-status disconnected';
+                indicator.className = 'status-indicator disconnected';
+            }
+        }
+        
+        function updateLastRefreshTime() {
+            const timeElement = document.getElementById('lastUpdateTime');
+            if (timeElement) {
+                const now = new Date();
+                timeElement.textContent = `最后更新: ${now.toLocaleTimeString()}`;
+            }
+        }
+
+        // 页面卸载时断开 MQTT 连接和清理定时器
         window.addEventListener('beforeunload', function() {
             if (mqttClient && isConnected) {
                 mqttClient.end();
+            }
+            if (autoRefreshTimer) {
+                clearInterval(autoRefreshTimer);
             }
         });
     </script>
