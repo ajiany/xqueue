@@ -1,6 +1,7 @@
 package api
 
 import (
+	"fmt"
 	"net/http"
 	"strconv"
 	"time"
@@ -26,6 +27,11 @@ type TaskManager interface {
 	UnregisterHandler(taskType string) error
 	IsHandlerRegistered(taskType string) bool
 	GetRegisteredHandlers() []string
+
+	// v0.0.3 并发控制管理
+	SetConcurrencyLimit(taskType string, maxConcurrency int) error
+	GetConcurrencyLimit(taskType string) (int, bool)
+	GetAllConcurrencyLimits() map[string]int
 }
 
 // TaskOption 任务选项
@@ -71,6 +77,13 @@ func (h *Handler) SetupRoutes(r *gin.Engine) {
 		{
 			handlers.GET("", h.GetHandlers)
 		}
+
+		// v0.0.3 并发控制管理
+		concurrency := api.Group("/concurrency")
+		{
+			concurrency.GET("", h.GetConcurrencyLimits)
+			concurrency.POST("", h.SetConcurrencyLimit)
+		}
 	}
 }
 
@@ -82,8 +95,6 @@ type SubmitTaskRequest struct {
 	MaxRetry       int                    `json:"max_retry"`
 	QueueTimeout   int                    `json:"queue_timeout"`   // 秒
 	ProcessTimeout int                    `json:"process_timeout"` // 秒
-	ConcurrencyKey string                 `json:"concurrency_key"`
-	MaxConcurrency int                    `json:"max_concurrency"`
 }
 
 // SubmitTask 提交任务
@@ -110,10 +121,6 @@ func (h *Handler) SubmitTask(c *gin.Context) {
 		queueTimeout := time.Duration(req.QueueTimeout) * time.Second
 		processTimeout := time.Duration(req.ProcessTimeout) * time.Second
 		options = append(options, WithTimeout(queueTimeout, processTimeout))
-	}
-
-	if req.ConcurrencyKey != "" {
-		options = append(options, WithConcurrency(req.ConcurrencyKey, req.MaxConcurrency))
 	}
 
 	// 提交任务
@@ -280,13 +287,6 @@ func WithTimeout(queueTimeout, processTimeout time.Duration) TaskOption {
 	}
 }
 
-func WithConcurrency(key string, maxConcurrency int) TaskOption {
-	return func(task *models.Task) {
-		task.ConcurrencyKey = key
-		task.MaxConcurrency = maxConcurrency
-	}
-}
-
 // GetHandlers 获取已注册的处理器列表
 func (h *Handler) GetHandlers(c *gin.Context) {
 	handlers := h.taskManager.GetRegisteredHandlers()
@@ -294,5 +294,57 @@ func (h *Handler) GetHandlers(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{
 		"handlers": handlers,
 		"count":    len(handlers),
+	})
+}
+
+// GetConcurrencyLimits 获取所有并发限制配置
+func (h *Handler) GetConcurrencyLimits(c *gin.Context) {
+	limits := h.taskManager.GetAllConcurrencyLimits()
+
+	c.JSON(http.StatusOK, gin.H{
+		"limits": limits,
+		"count":  len(limits),
+	})
+}
+
+// SetConcurrencyLimitRequest 设置并发限制请求
+type SetConcurrencyLimitRequest struct {
+	TaskType       string `json:"task_type" binding:"required"`
+	MaxConcurrency int    `json:"max_concurrency" binding:"required,min=1"`
+}
+
+// SetConcurrencyLimit 设置任务类型的并发限制
+func (h *Handler) SetConcurrencyLimit(c *gin.Context) {
+	var req SetConcurrencyLimitRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		h.logger.WithError(err).Error("Invalid request")
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	// 检查任务类型是否已注册
+	if !h.taskManager.IsHandlerRegistered(req.TaskType) {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error": fmt.Sprintf("task type '%s' is not registered", req.TaskType),
+		})
+		return
+	}
+
+	err := h.taskManager.SetConcurrencyLimit(req.TaskType, req.MaxConcurrency)
+	if err != nil {
+		h.logger.WithError(err).Error("Failed to set concurrency limit")
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	h.logger.WithFields(logrus.Fields{
+		"task_type":       req.TaskType,
+		"max_concurrency": req.MaxConcurrency,
+	}).Info("Concurrency limit set successfully")
+
+	c.JSON(http.StatusOK, gin.H{
+		"message":         "Concurrency limit set successfully",
+		"task_type":       req.TaskType,
+		"max_concurrency": req.MaxConcurrency,
 	})
 }

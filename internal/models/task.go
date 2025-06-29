@@ -34,8 +34,6 @@ type Task struct {
 	CompletedAt    *time.Time             `json:"completed_at"`    // 完成时间
 	Error          string                 `json:"error,omitempty"` // 错误信息
 	WorkerID       string                 `json:"worker_id"`       // 处理该任务的工作者ID
-	ConcurrencyKey string                 `json:"concurrency_key"` // 并发控制key
-	MaxConcurrency int                    `json:"max_concurrency"` // 最大并发数
 }
 
 // ToJSON 将任务转换为JSON字符串

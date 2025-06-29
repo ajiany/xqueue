@@ -1,5 +1,94 @@
 # XQueue 更新日志
 
+## Version 0.0.3
+
+### 🔄 重大架构重构
+
+#### 并发控制架构重新设计
+- ✅ **修复根本性设计缺陷**：从单任务级别的并发控制重构为任务类型级别的全局并发控制
+- ✅ **新增 ConcurrencyManager 组件**：集中管理所有任务类型的并发限制配置
+- ✅ **信号量令牌机制**：基于 Redis 实现分布式并发控制，确保任务类型级别的并发限制
+- ✅ **动态配置管理**：支持运行时调整任务类型的并发限制
+
+#### API 接口重构
+- ✅ **新增并发控制管理接口**：
+  - `GET /api/v1/concurrency` - 获取所有任务类型的并发限制配置
+  - `POST /api/v1/concurrency` - 设置特定任务类型的并发限制
+- ✅ **简化任务提交参数**：移除不再需要的 `concurrency_key` 和 `max_concurrency` 参数
+- ✅ **增强任务处理流程**：集成并发令牌获取和释放机制
+
+### 🛠️ 实现细节
+
+#### 核心组件
+- **ConcurrencyManager** (`internal/concurrency/manager.go`)：
+  - 管理任务类型到并发限制的映射
+  - 缓存和管理 Redis 信号量实例
+  - 提供令牌获取、释放和统计功能
+- **TaskManager 增强**：
+  - 集成 ConcurrencyManager
+  - 在任务处理过程中自动应用并发控制
+  - 确保令牌的正确获取和释放
+
+#### 数据模型优化
+- **Task 结构体简化**：移除 `ConcurrencyKey` 和 `MaxConcurrency` 字段
+- **配置集中化**：并发限制配置从任务实例转移到 TaskManager 层面
+
+### 🔧 改进优化
+
+#### 性能优化
+- **信号量缓存机制**：避免重复创建 Redis 信号量实例
+- **双重检查锁定**：确保并发环境下信号量创建的线程安全
+- **自动令牌清理**：定期清理过期的并发令牌
+
+#### 错误处理增强
+- **令牌获取失败处理**：任务状态更新失败时自动释放已获取的令牌
+- **Panic 恢复机制**：确保即使任务处理发生 panic 也能正确释放令牌
+- **并发限制验证**：设置并发限制时验证任务类型是否已注册
+
+### 📝 文档更新
+- 更新 README.md 包含 v0.0.3 新功能说明
+- 重写并发控制使用示例
+- 更新 API 文档和参数说明
+- 创建 v0.0.3 功能测试脚本
+
+### 🎯 使用场景示例
+
+#### 设置并发限制
+```bash
+# 设置邮件任务最多 5 个并发
+curl -X POST http://localhost:8080/api/v1/concurrency \
+  -H "Content-Type: application/json" \
+  -d '{"task_type": "email", "max_concurrency": 5}'
+```
+
+#### 查看并发配置
+```bash
+# 获取所有并发限制配置
+curl http://localhost:8080/api/v1/concurrency
+```
+
+#### 任务提交（自动应用并发控制）
+```bash
+# 提交邮件任务，系统自动应用 email 类型的并发限制
+curl -X POST http://localhost:8080/api/v1/tasks \
+  -H "Content-Type: application/json" \
+  -d '{"type": "email", "payload": {"to": "test@example.com"}}'
+```
+
+### ⚠️ 破坏性变更
+
+#### API 变更
+- **移除任务提交参数**：`concurrency_key` 和 `max_concurrency` 不再支持
+- **并发控制方式变更**：从任务级别改为任务类型级别的全局控制
+
+#### 迁移指南
+- **v0.0.2 → v0.0.3**：
+  1. 移除任务提交时的并发控制参数
+  2. 使用新的并发控制管理 API 设置任务类型级别的限制
+  3. 更新客户端代码以适应新的 API 接口
+
+---
+
 ## Version 0.0.2
 
 ### 🆕 新功能

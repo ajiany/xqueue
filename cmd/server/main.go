@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"xqueue/internal/api"
+	"xqueue/internal/concurrency"
 	"xqueue/internal/config"
 	"xqueue/internal/lock"
 	"xqueue/internal/models"
@@ -26,11 +27,12 @@ import (
 
 // EnhancedTaskManager 增强版任务管理器
 type EnhancedTaskManager struct {
-	storage    *storage.RedisStorage
-	notifier   *notifier.MQTTNotifier
-	lock       *lock.RedisLock
-	logger     *logrus.Logger
-	workerPool *worker.WorkerPool
+	storage        *storage.RedisStorage
+	notifier       *notifier.MQTTNotifier
+	lock           *lock.RedisLock
+	concurrencyMgr *concurrency.ConcurrencyManager
+	logger         *logrus.Logger
+	workerPool     *worker.WorkerPool
 
 	// 处理器管理
 	handlers map[string]models.TaskHandler
@@ -56,12 +58,13 @@ func NewEnhancedTaskManager(storage *storage.RedisStorage, notifier *notifier.MQ
 	redisClient *redis.Client, logger *logrus.Logger) *EnhancedTaskManager {
 
 	taskManager := &EnhancedTaskManager{
-		storage:    storage,
-		notifier:   notifier,
-		lock:       lock.NewRedisLock(redisClient, logger),
-		logger:     logger,
-		handlers:   make(map[string]models.TaskHandler),
-		instanceID: uuid.New().String(),
+		storage:        storage,
+		notifier:       notifier,
+		lock:           lock.NewRedisLock(redisClient, logger),
+		concurrencyMgr: concurrency.NewConcurrencyManager(redisClient, logger, 5*time.Minute),
+		logger:         logger,
+		handlers:       make(map[string]models.TaskHandler),
+		instanceID:     uuid.New().String(),
 	}
 
 	// 创建worker池适配器
@@ -213,8 +216,10 @@ func (tm *EnhancedTaskManager) GetStats() (map[string]interface{}, error) {
 
 // ProcessTask 处理单个任务
 func (tm *EnhancedTaskManager) ProcessTask(taskID string) error {
+	ctx := context.Background()
+
 	// 获取任务
-	task, err := tm.storage.GetTask(context.Background(), taskID)
+	task, err := tm.storage.GetTask(ctx, taskID)
 	if err != nil {
 		return fmt.Errorf("failed to get task: %w", err)
 	}
@@ -233,8 +238,16 @@ func (tm *EnhancedTaskManager) ProcessTask(taskID string) error {
 		return fmt.Errorf("no handler found for task type: %s", task.Type)
 	}
 
+	// 获取并发控制令牌
+	concurrencyToken, err := tm.concurrencyMgr.AcquireToken(ctx, task.Type)
+	if err != nil {
+		return fmt.Errorf("failed to acquire concurrency token: %w", err)
+	}
+
 	// 更新任务状态为处理中
-	if err := tm.storage.UpdateTaskStatus(context.Background(), taskID, models.TaskStatusProcessing, ""); err != nil {
+	if err := tm.storage.UpdateTaskStatus(ctx, taskID, models.TaskStatusProcessing, ""); err != nil {
+		// 释放并发令牌
+		tm.concurrencyMgr.ReleaseToken(ctx, task.Type, concurrencyToken)
 		return fmt.Errorf("failed to update task status to processing: %w", err)
 	}
 
@@ -244,13 +257,23 @@ func (tm *EnhancedTaskManager) ProcessTask(taskID string) error {
 	}
 
 	tm.logger.WithFields(logrus.Fields{
-		"task_id":   taskID,
-		"task_type": task.Type,
+		"task_id":           taskID,
+		"task_type":         task.Type,
+		"concurrency_token": concurrencyToken,
 	}).Info("Started processing task")
 
 	// 在 goroutine 中处理任务
 	go func() {
 		defer func() {
+			// 确保释放并发令牌
+			if err := tm.concurrencyMgr.ReleaseToken(context.Background(), task.Type, concurrencyToken); err != nil {
+				tm.logger.WithError(err).WithFields(logrus.Fields{
+					"task_id":           taskID,
+					"task_type":         task.Type,
+					"concurrency_token": concurrencyToken,
+				}).Warn("Failed to release concurrency token")
+			}
+
 			if r := recover(); r != nil {
 				tm.logger.WithFields(logrus.Fields{
 					"task_id": taskID,
@@ -407,6 +430,21 @@ func (h *EmailTaskHandler) GetType() string {
 	return "email"
 }
 
+// SetConcurrencyLimit 设置任务类型的并发限制
+func (tm *EnhancedTaskManager) SetConcurrencyLimit(taskType string, maxConcurrency int) error {
+	return tm.concurrencyMgr.SetConcurrencyLimit(taskType, maxConcurrency)
+}
+
+// GetConcurrencyLimit 获取任务类型的并发限制
+func (tm *EnhancedTaskManager) GetConcurrencyLimit(taskType string) (int, bool) {
+	return tm.concurrencyMgr.GetConcurrencyLimit(taskType)
+}
+
+// GetAllConcurrencyLimits 获取所有并发限制配置
+func (tm *EnhancedTaskManager) GetAllConcurrencyLimits() map[string]int {
+	return tm.concurrencyMgr.GetAllLimits()
+}
+
 func main() {
 	// 创建日志器
 	logger := logrus.New()
@@ -455,16 +493,18 @@ func main() {
 	// 创建增强版任务管理器
 	taskManager := NewEnhancedTaskManager(storage, mqttNotifier, redisClient, logger)
 
-	// 注册任务处理器
+	// 注册默认处理器
 	exampleHandler := &ExampleTaskHandler{logger: logger}
-	if err := taskManager.RegisterHandler(exampleHandler); err != nil {
-		logger.WithError(err).Fatal("Failed to register example handler")
-	}
-
 	emailHandler := &EmailTaskHandler{logger: logger}
-	if err := taskManager.RegisterHandler(emailHandler); err != nil {
-		logger.WithError(err).Fatal("Failed to register email handler")
-	}
+
+	taskManager.RegisterHandler(exampleHandler)
+	taskManager.RegisterHandler(emailHandler)
+
+	// 设置默认并发限制 (v0.0.3)
+	taskManager.SetConcurrencyLimit("example", 3) // 示例任务最多3个并发
+	taskManager.SetConcurrencyLimit("email", 5)   // 邮件任务最多5个并发
+
+	logger.Info("Default task handlers and concurrency limits registered")
 
 	// 启动工作池
 	if err := taskManager.StartWorkerPool(); err != nil {
