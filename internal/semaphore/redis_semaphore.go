@@ -31,41 +31,54 @@ func NewRedisSemaphore(client *redis.Client, key string, maxTokens int64, expira
 func (s *RedisSemaphore) Acquire(ctx context.Context) (string, error) {
 	token := uuid.New().String()
 
+	// 使用Go的时间戳而不是Redis的TIME命令，避免可能的nil值
+	now := time.Now().Unix()
+
 	// Lua脚本确保原子性操作
 	luaScript := `
 		local key = KEYS[1]
 		local token = ARGV[1]
 		local max_tokens = tonumber(ARGV[2])
 		local expiration = tonumber(ARGV[3])
+		local current_time = tonumber(ARGV[4])
 		
 		-- 清理过期的令牌
-		redis.call('ZREMRANGEBYSCORE', key, 0, redis.call('TIME')[1] - expiration)
+		redis.call('ZREMRANGEBYSCORE', key, 0, current_time - expiration)
 		
 		-- 检查当前令牌数量
 		local current_count = redis.call('ZCARD', key)
 		if current_count < max_tokens then
 			-- 添加新令牌
-			local timestamp = redis.call('TIME')[1]
-			redis.call('ZADD', key, timestamp, token)
+			redis.call('ZADD', key, current_time, token)
 			redis.call('EXPIRE', key, expiration)
 			return token
 		else
-			return nil
+			return "NO_TOKENS_AVAILABLE"
 		end
 	`
 
 	result, err := s.client.Eval(ctx, luaScript, []string{s.key},
-		token, s.maxTokens, int64(s.expiration.Seconds())).Result()
+		token, s.maxTokens, int64(s.expiration.Seconds()), now).Result()
 
 	if err != nil {
 		return "", fmt.Errorf("failed to acquire semaphore: %w", err)
 	}
 
+	// 检查返回值
 	if result == nil {
 		return "", fmt.Errorf("no available tokens")
 	}
 
-	return token, nil
+	resultStr, ok := result.(string)
+	if !ok {
+		return "", fmt.Errorf("unexpected result type from semaphore script")
+	}
+
+	if resultStr == "NO_TOKENS_AVAILABLE" {
+		return "", fmt.Errorf("no available tokens")
+	}
+
+	return resultStr, nil
 }
 
 // Release 释放信号量令牌

@@ -76,6 +76,77 @@ func (r *RedisStorage) SaveTask(ctx context.Context, task *models.Task) error {
 	return nil
 }
 
+// SaveTaskForStream 为Stream架构保存任务（不添加pending状态到索引）
+// 在Stream架构中，pending状态由Stream本身管理，不需要在zset索引中重复
+func (r *RedisStorage) SaveTaskForStream(ctx context.Context, task *models.Task) error {
+	data, err := task.ToJSON()
+	if err != nil {
+		return fmt.Errorf("failed to marshal task: %w", err)
+	}
+
+	// 获取任务的旧状态（如果存在）
+	taskKey := fmt.Sprintf("task:%s", task.ID)
+	oldStatusData, _ := r.client.HGet(ctx, taskKey, "status").Result()
+
+	// 使用 Hash 存储任务详情
+	err = r.client.HMSet(ctx, taskKey, map[string]interface{}{
+		"data":       string(data),
+		"status":     string(task.Status),
+		"type":       task.Type,
+		"created_at": task.CreatedAt.Unix(),
+		"updated_at": task.UpdatedAt.Unix(),
+	}).Err()
+
+	if err != nil {
+		return fmt.Errorf("failed to save task: %w", err)
+	}
+
+	// 设置任务过期时间
+	if task.QueueTimeout > 0 {
+		err = r.client.Expire(ctx, taskKey, task.QueueTimeout).Err()
+		if err != nil {
+			return fmt.Errorf("failed to set task expiration: %w", err)
+		}
+	}
+
+	// 如果有旧状态且不是pending，从旧状态索引中移除
+	if oldStatusData != "" && oldStatusData != string(models.TaskStatusPending) {
+		oldStatusKey := fmt.Sprintf("tasks:status:%s", oldStatusData)
+		err = r.client.ZRem(ctx, oldStatusKey, task.ID).Err()
+		if err != nil {
+			return fmt.Errorf("failed to remove from old status index: %w", err)
+		}
+	}
+
+	// 在Stream架构中，只有非pending状态的任务才添加到索引
+	// pending状态由Stream本身管理
+	if task.Status != models.TaskStatusPending {
+		// 添加到状态索引
+		statusKey := fmt.Sprintf("tasks:status:%s", task.Status)
+		err = r.client.ZAdd(ctx, statusKey, &redis.Z{
+			Score:  float64(task.UpdatedAt.Unix()),
+			Member: task.ID,
+		}).Err()
+
+		if err != nil {
+			return fmt.Errorf("failed to add task to status index: %w", err)
+		}
+	}
+
+	// 添加到类型索引
+	typeKey := fmt.Sprintf("tasks:type:%s", task.Type)
+	err = r.client.ZAdd(ctx, typeKey, &redis.Z{
+		Score:  float64(task.UpdatedAt.Unix()),
+		Member: task.ID,
+	}).Err()
+
+	if err != nil {
+		return fmt.Errorf("failed to add task to type index: %w", err)
+	}
+
+	return nil
+}
+
 // GetTask 获取任务
 func (r *RedisStorage) GetTask(ctx context.Context, taskID string) (*models.Task, error) {
 	taskKey := fmt.Sprintf("task:%s", taskID)
@@ -219,11 +290,27 @@ func (r *RedisStorage) GetTaskStats(ctx context.Context) (map[string]int64, erro
 		models.TaskStatusTimeout,
 	}
 
-	for _, status := range statuses {
+	// 使用Pipeline批量执行命令，减少网络往返次数
+	pipe := r.client.Pipeline()
+	cmds := make([]*redis.IntCmd, len(statuses))
+
+	for i, status := range statuses {
 		statusKey := fmt.Sprintf("tasks:status:%s", status)
-		count, err := r.client.ZCard(ctx, statusKey).Result()
+		cmds[i] = pipe.ZCard(ctx, statusKey)
+	}
+
+	// 执行Pipeline
+	_, err := pipe.Exec(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get status count: %w", err)
+	}
+
+	// 获取结果
+	for i, status := range statuses {
+		count, err := cmds[i].Result()
 		if err != nil {
-			return nil, fmt.Errorf("failed to get status count: %w", err)
+			// 如果某个状态获取失败，设置为0而不是整体失败
+			count = 0
 		}
 		stats[string(status)] = count
 	}

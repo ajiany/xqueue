@@ -31,13 +31,18 @@ type ConcurrencyManager struct {
 
 // NewConcurrencyManager 创建并发控制管理器
 func NewConcurrencyManager(redisClient *redis.Client, logger *logrus.Logger, semaphoreExpiration time.Duration) *ConcurrencyManager {
-	return &ConcurrencyManager{
+	cm := &ConcurrencyManager{
 		redisClient:         redisClient,
 		logger:              logger,
 		limits:              make(map[string]int),
 		semaphores:          make(map[string]*semaphore.RedisSemaphore),
 		semaphoreExpiration: semaphoreExpiration,
 	}
+
+	// 启动时清理可能泄漏的令牌
+	go cm.cleanupLeakedTokens()
+
+	return cm
 }
 
 // SetConcurrencyLimit 设置任务类型的并发限制
@@ -194,4 +199,50 @@ func (cm *ConcurrencyManager) GetAllLimits() map[string]int {
 	}
 
 	return result
+}
+
+// cleanupLeakedTokens 清理可能泄漏的令牌
+func (cm *ConcurrencyManager) cleanupLeakedTokens() {
+	ctx := context.Background()
+
+	// 等待一小段时间让系统启动完成
+	time.Sleep(5 * time.Second)
+
+	// 扫描所有可能的信号量键
+	pattern := "concurrency:*"
+	keys, err := cm.redisClient.Keys(ctx, pattern).Result()
+	if err != nil {
+		cm.logger.WithError(err).Warn("Failed to scan for semaphore keys during cleanup")
+		return
+	}
+
+	cleanedCount := 0
+	for _, key := range keys {
+		// 清理过期令牌
+		now := time.Now().Unix()
+		expiredTime := now - int64(cm.semaphoreExpiration.Seconds())
+
+		removed, err := cm.redisClient.ZRemRangeByScore(ctx, key, "0", fmt.Sprintf("%d", expiredTime)).Result()
+		if err != nil {
+			cm.logger.WithFields(logrus.Fields{
+				"key":   key,
+				"error": err,
+			}).Warn("Failed to cleanup tokens for key")
+			continue
+		}
+
+		if removed > 0 {
+			cleanedCount += int(removed)
+			cm.logger.WithFields(logrus.Fields{
+				"key":     key,
+				"removed": removed,
+			}).Info("Cleaned up leaked tokens")
+		}
+	}
+
+	if cleanedCount > 0 {
+		cm.logger.WithField("total_cleaned", cleanedCount).Info("Token cleanup completed")
+	} else {
+		cm.logger.Debug("No leaked tokens found during startup cleanup")
+	}
 }

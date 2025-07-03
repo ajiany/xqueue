@@ -625,7 +625,13 @@
         function handleStatsMessage(message) {
             try {
                 const stats = JSON.parse(message);
-                updateStatsDisplay(stats);
+                // v0.0.5 Stream架构：统一数据格式
+                updateStatsDisplay({
+                    pending: stats.pending_tasks || stats.pending || 0,
+                    processing: stats.processing_tasks || stats.processing || 0,
+                    success: stats.success_tasks || stats.success || 0,
+                    failed: stats.failed_tasks || stats.failed || 0
+                });
             } catch (error) {
                 log('解析统计消息失败: ' + error.message);
             }
@@ -721,7 +727,13 @@
                      ? await silentApiCall('/api/v1/stats')
                      : await apiCall('/api/v1/stats');
                  
-                 updateStatsDisplay(stats.tasks);
+                 // v0.0.5 Stream架构：数据直接在根级别，不在stats.tasks下
+                 updateStatsDisplay({
+                     pending: stats.pending_tasks || 0,
+                     processing: stats.processing_tasks || 0,
+                     success: stats.success_tasks || 0,
+                     failed: stats.failed_tasks || 0
+                 });
              } catch (error) {
                  // 设置默认值
                  updateStatsDisplay({

@@ -64,8 +64,8 @@ func DefaultConfig() *Config {
 			Addr:         "localhost:6379",
 			Password:     "",
 			DB:           0,
-			PoolSize:     10,
-			MinIdleConns: 2,
+			PoolSize:     50, // 增加连接池大小以处理高并发请求
+			MinIdleConns: 10, // 增加最小空闲连接数
 		},
 		Kafka: KafkaConfig{
 			Brokers:      []string{"localhost:9092"},
@@ -92,7 +92,7 @@ func DefaultConfig() *Config {
 			MaxConcurrency:      100,
 			CleanupInterval:     time.Minute * 5,
 			HeartbeatInterval:   time.Second * 30,
-			SemaphoreExpiration: time.Minute * 5,
+			SemaphoreExpiration: time.Minute * 2, // 减少到2分钟，避免进程重启时的令牌泄漏
 		},
 	}
 }
